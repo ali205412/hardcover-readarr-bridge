@@ -372,15 +372,49 @@ def hardcover_search_book(title, author=None, isbn=None, asin=None):
     return None
 
 
-def hardcover_set_book_status(book_id, status_id):
+def hardcover_set_book_status(book_id, status_id, progress=None):
+    # 1. Set book status (adds to shelf)
     mutation = """
     mutation SetStatus($bookId: Int!, $statusId: Int!) {
         insert_user_book(object: {book_id: $bookId, status_id: $statusId}) {
             id
+            user_book_reads { id }
         }
     }
     """
-    return hardcover_query(mutation, {"bookId": book_id, "statusId": status_id})
+    result = hardcover_query(mutation, {"bookId": book_id, "statusId": status_id})
+    if not result:
+        return None
+
+    # 2. Update progress if provided and book is in-progress
+    if progress is not None and 0 < progress < 1.0:
+        user_book = result.get("insert_user_book", {})
+        user_book_id = user_book.get("id")
+        reads = user_book.get("user_book_reads", [])
+
+        if user_book_id and reads:
+            read_id = reads[0].get("id")
+            if read_id:
+                pct = round(progress * 100)
+                update = """
+                mutation UpdateProgress($readId: Int!, $object: UpdateUserBookReadInput!) {
+                    update_user_book_read(id: $readId, object: $object) { id }
+                }
+                """
+                hardcover_query(update, {"readId": read_id, "object": {"progress": pct}})
+                log.debug("Set progress %d%% on read %d", pct, read_id)
+        elif user_book_id:
+            # No existing read, create one with progress
+            pct = round(progress * 100)
+            insert_read = """
+            mutation InsertRead($userBookId: Int!, $read: UserBookReadInput!) {
+                insert_user_book_read(user_book_id: $userBookId, user_book_read: $read) { id }
+            }
+            """
+            hardcover_query(insert_read, {"userBookId": user_book_id, "read": {"progress": pct}})
+            log.debug("Created read with progress %d%% for user_book %d", pct, user_book_id)
+
+    return result
 
 
 def sync_abs_to_hardcover():
@@ -442,10 +476,12 @@ def sync_abs_to_hardcover():
             continue
 
         hc_book_id = hc_book.get("id")
-        status_id = 3 if progress.get("isFinished") else 2  # 3=Read, 2=Currently Reading
+        is_finished = progress.get("isFinished")
+        abs_progress = progress.get("progress", 0)
+        status_id = 3 if is_finished else 2  # 3=Read, 2=Currently Reading
 
         if DRY_RUN:
-            status_label = "Read" if status_id == 3 else "Reading"
+            status_label = "Read" if status_id == 3 else f"Reading ({abs_progress*100:.0f}%)"
             log.info("[DRY RUN] Would set %s -> %s on Hardcover", title, status_label)
             added += 1
             state["abs_synced"][state_key] = {
@@ -456,9 +492,9 @@ def sync_abs_to_hardcover():
             }
             continue
 
-        result = hardcover_set_book_status(hc_book_id, status_id)
+        result = hardcover_set_book_status(hc_book_id, status_id, progress=abs_progress if not is_finished else None)
         if result:
-            status_label = "Read" if status_id == 3 else "Reading"
+            status_label = "Read" if status_id == 3 else f"Reading ({abs_progress*100:.0f}%)"
             log.info("Hardcover: %s -> %s", title, status_label)
             state["abs_synced"][state_key] = {
                 "title": title,

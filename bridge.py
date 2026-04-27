@@ -166,7 +166,10 @@ def get_hardcover_books(status_ids):
         """
         data = hardcover_query(query, {"statusId": status_id})
         if data and data.get("me"):
-            books = data["me"].get("user_books", [])
+            me = data["me"]
+            if isinstance(me, list):
+                me = me[0] if me else {}
+            books = me.get("user_books", [])
             log.info("Hardcover shelf %d: %d books", status_id, len(books))
             all_books.extend(books)
     return all_books

@@ -57,6 +57,7 @@ MAX_WEBHOOK_BODY = 1024 * 1024  # 1 MB
 HARDCOVER_API = "https://api.hardcover.app/v1/graphql"
 
 _sync_lock = Lock()
+_last_hc_request = 0.0  # timestamp of last Hardcover API call
 
 
 def load_state():
@@ -75,7 +76,14 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-def hardcover_query(query, variables=None):
+def hardcover_query(query, variables=None, retries=2):
+    global _last_hc_request
+    # Enforce 1.1s between requests (max ~54/min, under 60/min limit)
+    elapsed = time.time() - _last_hc_request
+    if elapsed < 1.1:
+        time.sleep(1.1 - elapsed)
+    _last_hc_request = time.time()
+
     body = json.dumps({"query": query, "variables": variables or {}}).encode()
     req = Request(
         HARDCOVER_API,
@@ -92,8 +100,15 @@ def hardcover_query(query, variables=None):
             log.error("Hardcover GraphQL error: %s", data["errors"])
             return None
         return data.get("data")
-    except (HTTPError, URLError):
+    except HTTPError as e:
+        if e.code == 429 and retries > 0:
+            log.warning("Rate limited, waiting 60s before retry...")
+            time.sleep(60)
+            return hardcover_query(query, variables, retries - 1)
         log.exception("Hardcover API error")
+        return None
+    except URLError:
+        log.exception("Hardcover connection error")
         return None
 
 

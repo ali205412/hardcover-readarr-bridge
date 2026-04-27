@@ -1,0 +1,24 @@
+services:
+  hardcover-readarr-bridge:
+    build: .
+    container_name: hardcover-readarr-bridge
+    restart: unless-stopped
+    environment:
+      - HARDCOVER_TOKEN=${HARDCOVER_TOKEN}
+      - READARR_URL=http://readarr:8787
+      - READARR_API_KEY=${READARR_API_KEY}
+      - POLL_INTERVAL=3600
+      - SHELF_IDS=1
+      - ROOT_FOLDER=/books
+      - QUALITY_PROFILE_ID=2
+      - METADATA_PROFILE_ID=1
+      - MONITOR_TYPE=specificBook
+      - SEARCH_ON_ADD=true
+      - WEBHOOK_ENABLED=true
+      - WEBHOOK_PORT=9876
+      - DRY_RUN=false
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/data
+    expose:
+      - 9876

@@ -378,7 +378,6 @@ def hardcover_set_book_status(book_id, status_id, progress=None):
     mutation SetStatus($bookId: Int!, $statusId: Int!) {
         insert_user_book(object: {book_id: $bookId, status_id: $statusId}) {
             id
-            user_book_reads { id }
         }
     }
     """
@@ -390,20 +389,8 @@ def hardcover_set_book_status(book_id, status_id, progress=None):
     if progress is not None and 0 < progress < 1.0:
         user_book = result.get("insert_user_book", {})
         user_book_id = user_book.get("id")
-        reads = user_book.get("user_book_reads", [])
 
-        if user_book_id and reads:
-            read_id = reads[0].get("id")
-            if read_id:
-                pct = round(progress * 100)
-                update = """
-                mutation UpdateProgress($readId: Int!, $object: UpdateUserBookReadInput!) {
-                    update_user_book_read(id: $readId, object: $object) { id }
-                }
-                """
-                hardcover_query(update, {"readId": read_id, "object": {"progress": pct}})
-                log.debug("Set progress %d%% on read %d", pct, read_id)
-        elif user_book_id:
+        if user_book_id:
             # No existing read, create one with progress
             pct = round(progress * 100)
             insert_read = """

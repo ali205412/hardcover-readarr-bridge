@@ -393,7 +393,6 @@ def hardcover_set_book_status(book_id, status_id):
     mutation SetStatus($bookId: Int!, $statusId: Int!) {
         insert_user_book(object: {book_id: $bookId, status_id: $statusId}) {
             id
-            status_id
         }
     }
     """

@@ -48,6 +48,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 SEARCH_ON_ADD = os.getenv("SEARCH_ON_ADD", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 STATE_FILE = os.getenv("STATE_FILE", "/data/synced_books.json")
+ABS_URL = os.getenv("ABS_URL", "")
+ABS_TOKEN = os.getenv("ABS_TOKEN", "")
+ABS_SYNC_ENABLED = os.getenv("ABS_SYNC_ENABLED", "false").lower() == "true"
 BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0")
 MAX_WEBHOOK_BODY = 1024 * 1024  # 1 MB
 
@@ -255,6 +258,8 @@ def sync():
         return
     try:
         _sync_inner()
+        if ABS_SYNC_ENABLED:
+            sync_abs_to_hardcover()
     except Exception:
         log.exception("Sync failed")
     finally:
@@ -308,6 +313,152 @@ def _sync_inner():
 
     save_state(state)
     log.info("Sync complete: added=%d skipped=%d failed=%d", added, skipped, failed)
+
+
+def abs_get(path):
+    req = Request(
+        f"{ABS_URL}{path}",
+        headers={"Authorization": f"Bearer {ABS_TOKEN}"},
+    )
+    try:
+        resp = urlopen(req, timeout=30)
+        body = resp.read()
+        return json.loads(body) if body else None
+    except (HTTPError, URLError):
+        log.exception("ABS API error %s", path)
+        return None
+
+
+def hardcover_search_book(title, author=None):
+    # Hasura _ilike for case-insensitive search
+    # Clean title for search - remove subtitles after colon
+    search_title = title.split(":")[0].strip() if ":" in title else title
+    search_title = search_title.replace("%", "")  # sanitize
+
+    query = """
+    query SearchBooks($titlePattern: String!) {
+        books(where: {title: {_ilike: $titlePattern}}, limit: 5) {
+            id
+            title
+            slug
+            contributions { author { name } }
+        }
+    }
+    """
+    data = hardcover_query(query, {"titlePattern": f"%{search_title}%"})
+    if not data or not data.get("books"):
+        return None
+    results = data["books"]
+    title_lower = title.lower()
+    for r in results:
+        r_title = r.get("title", "").lower()
+        if title_lower in r_title or r_title in title_lower:
+            return r
+    return results[0] if results else None
+
+
+def hardcover_set_book_status(book_id, status_id):
+    mutation = """
+    mutation SetStatus($bookId: Int!, $statusId: Int!) {
+        insert_user_book(object: {book_id: $bookId, status_id: $statusId}) {
+            id
+            status_id
+        }
+    }
+    """
+    return hardcover_query(mutation, {"bookId": book_id, "statusId": status_id})
+
+
+def sync_abs_to_hardcover():
+    if not ABS_URL or not ABS_TOKEN or not HARDCOVER_TOKEN:
+        log.debug("ABS sync not configured, skipping")
+        return
+
+    log.info("Syncing ABS listening history to Hardcover")
+
+    state = load_state()
+    if "abs_synced" not in state:
+        state["abs_synced"] = {}
+
+    # Get ABS user progress
+    me = abs_get("/api/me")
+    if not me:
+        log.error("Failed to get ABS user data")
+        return
+
+    progress_list = me.get("mediaProgress", [])
+    finished = [p for p in progress_list if p.get("isFinished")]
+    in_progress = [p for p in progress_list if not p.get("isFinished") and p.get("progress", 0) > 0]
+
+    log.info("ABS: %d finished, %d in progress", len(finished), len(in_progress))
+
+    added = 0
+    skipped = 0
+    failed = 0
+
+    for progress in finished + in_progress:
+        lib_item_id = progress.get("libraryItemId", "")
+        state_key = f"abs_{lib_item_id}"
+
+        if state_key in state["abs_synced"]:
+            skipped += 1
+            continue
+
+        # Get book details from ABS
+        item = abs_get(f"/api/items/{lib_item_id}")
+        if not item:
+            failed += 1
+            continue
+
+        meta = item.get("media", {}).get("metadata", {})
+        title = meta.get("title", "")
+        author = meta.get("authorName", "")
+
+        if not title:
+            failed += 1
+            continue
+
+        # Search Hardcover for this book
+        hc_book = hardcover_search_book(title, author)
+        if not hc_book:
+            log.warning("Not found on Hardcover: %s by %s", title, author)
+            failed += 1
+            continue
+
+        hc_book_id = hc_book.get("id")
+        status_id = 3 if progress.get("isFinished") else 2  # 3=Read, 2=Currently Reading
+
+        if DRY_RUN:
+            status_label = "Read" if status_id == 3 else "Reading"
+            log.info("[DRY RUN] Would set %s -> %s on Hardcover", title, status_label)
+            added += 1
+            state["abs_synced"][state_key] = {
+                "title": title,
+                "hardcover_id": hc_book_id,
+                "status": status_id,
+                "synced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            continue
+
+        result = hardcover_set_book_status(hc_book_id, status_id)
+        if result:
+            status_label = "Read" if status_id == 3 else "Reading"
+            log.info("Hardcover: %s -> %s", title, status_label)
+            state["abs_synced"][state_key] = {
+                "title": title,
+                "hardcover_id": hc_book_id,
+                "status": status_id,
+                "synced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            added += 1
+        else:
+            log.error("Failed to set status on Hardcover: %s", title)
+            failed += 1
+
+        time.sleep(1)  # Hardcover rate limit: 60/min
+
+    save_state(state)
+    log.info("ABS -> Hardcover sync: added=%d skipped=%d failed=%d", added, skipped, failed)
 
 
 def _verify_webhook_signature(body, signature):
@@ -383,6 +534,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "sync_started"}).encode())
+            return
+
+        if self.path == "/sync-abs":
+            log.info("Manual ABS -> Hardcover sync triggered via API")
+            Thread(target=sync_abs_to_hardcover, daemon=True).start()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "abs_sync_started"}).encode())
             return
 
         self.send_response(404)

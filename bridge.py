@@ -329,31 +329,55 @@ def abs_get(path):
         return None
 
 
-def hardcover_search_book(title, author=None):
-    # Use editions table with _eq (Hardcover blocks _ilike on books)
-    # Clean title - remove subtitles after colon for better matching
-    search_title = title.split(":")[0].strip() if ":" in title else title
+def hardcover_search_book(title, author=None, isbn=None, asin=None):
+    # 1. Try ISBN first (most reliable)
+    if isbn:
+        query = """
+        query ByISBN($isbn: String!) {
+            editions(where: {isbn_13: {_eq: $isbn}}, limit: 1) {
+                book { id title slug }
+            }
+        }
+        """
+        data = hardcover_query(query, {"isbn": isbn})
+        if data:
+            for ed in data.get("editions", []):
+                book = ed.get("book", {})
+                if book.get("id"):
+                    log.debug("Matched by ISBN: %s -> %s", isbn, book.get("title"))
+                    return book
 
+    # 2. Try ASIN
+    if asin:
+        query = """
+        query ByASIN($asin: String!) {
+            editions(where: {asin: {_eq: $asin}}, limit: 1) {
+                book { id title slug }
+            }
+        }
+        """
+        data = hardcover_query(query, {"asin": asin})
+        if data:
+            for ed in data.get("editions", []):
+                book = ed.get("book", {})
+                if book.get("id"):
+                    log.debug("Matched by ASIN: %s -> %s", asin, book.get("title"))
+                    return book
+
+    # 3. Fall back to title search via editions
+    search_title = title.split(":")[0].strip() if ":" in title else title
     query = """
-    query SearchBook($title: String!) {
+    query ByTitle($title: String!) {
         editions(where: {title: {_eq: $title}}, limit: 5) {
             title
             book { id title slug }
         }
     }
     """
-    data = hardcover_query(query, {"title": search_title})
-    if data and data.get("editions"):
-        for ed in data["editions"]:
-            book = ed.get("book", {})
-            if book.get("id"):
-                return book
-
-    # Fallback: try full title if short title didn't match
-    if search_title != title:
-        data = hardcover_query(query, {"title": title})
-        if data and data.get("editions"):
-            for ed in data["editions"]:
+    for t in [search_title, title] if search_title != title else [title]:
+        data = hardcover_query(query, {"title": t})
+        if data:
+            for ed in data.get("editions", []):
                 book = ed.get("book", {})
                 if book.get("id"):
                     return book
@@ -417,13 +441,15 @@ def sync_abs_to_hardcover():
         meta = item.get("media", {}).get("metadata", {})
         title = meta.get("title", "")
         author = meta.get("authorName", "")
+        isbn = meta.get("isbn", "")
+        asin = meta.get("asin", "")
 
         if not title:
             failed += 1
             continue
 
-        # Search Hardcover for this book
-        hc_book = hardcover_search_book(title, author)
+        # Search Hardcover by ISBN/ASIN first, then title
+        hc_book = hardcover_search_book(title, author, isbn=isbn, asin=asin)
         if not hc_book:
             log.warning("Not found on Hardcover: %s by %s", title, author)
             failed += 1

@@ -330,31 +330,35 @@ def abs_get(path):
 
 
 def hardcover_search_book(title, author=None):
-    # Hasura _ilike for case-insensitive search
-    # Clean title for search - remove subtitles after colon
+    # Use editions table with _eq (Hardcover blocks _ilike on books)
+    # Clean title - remove subtitles after colon for better matching
     search_title = title.split(":")[0].strip() if ":" in title else title
-    search_title = search_title.replace("%", "")  # sanitize
 
     query = """
-    query SearchBooks($titlePattern: String!) {
-        books(where: {title: {_ilike: $titlePattern}}, limit: 5) {
-            id
+    query SearchBook($title: String!) {
+        editions(where: {title: {_eq: $title}}, limit: 5) {
             title
-            slug
-            contributions { author { name } }
+            book { id title slug }
         }
     }
     """
-    data = hardcover_query(query, {"titlePattern": f"%{search_title}%"})
-    if not data or not data.get("books"):
-        return None
-    results = data["books"]
-    title_lower = title.lower()
-    for r in results:
-        r_title = r.get("title", "").lower()
-        if title_lower in r_title or r_title in title_lower:
-            return r
-    return results[0] if results else None
+    data = hardcover_query(query, {"title": search_title})
+    if data and data.get("editions"):
+        for ed in data["editions"]:
+            book = ed.get("book", {})
+            if book.get("id"):
+                return book
+
+    # Fallback: try full title if short title didn't match
+    if search_title != title:
+        data = hardcover_query(query, {"title": title})
+        if data and data.get("editions"):
+            for ed in data["editions"]:
+                book = ed.get("book", {})
+                if book.get("id"):
+                    return book
+
+    return None
 
 
 def hardcover_set_book_status(book_id, status_id):

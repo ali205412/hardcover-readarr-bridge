@@ -4,10 +4,12 @@ Syncs books from your Hardcover shelves to Readarr.
 Supports both periodic polling and Hardcover webhooks.
 """
 
+import hmac
 import os
 import time
 import json
 import logging
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread, Lock
 from urllib.request import Request, urlopen
@@ -20,21 +22,34 @@ logging.basicConfig(
 )
 log = logging.getLogger("hardcover-readarr")
 
+
+def _env_int(key, default):
+    val = os.getenv(key, str(default))
+    try:
+        return int(val)
+    except ValueError:
+        log.error("Invalid integer for %s: %r, using default %d", key, val, default)
+        return default
+
+
 # Config from environment
 HARDCOVER_TOKEN = os.getenv("HARDCOVER_TOKEN", "")
 READARR_URL = os.getenv("READARR_URL", "http://readarr:8787")
 READARR_API_KEY = os.getenv("READARR_API_KEY", "")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "3600"))  # seconds
-SHELF_IDS = os.getenv("SHELF_IDS", "1")  # 1=want-to-read, 2=reading, 3=read
+POLL_INTERVAL = _env_int("POLL_INTERVAL", 3600)
+SHELF_IDS = os.getenv("SHELF_IDS", "1")
 ROOT_FOLDER = os.getenv("ROOT_FOLDER", "/books")
-QUALITY_PROFILE_ID = int(os.getenv("QUALITY_PROFILE_ID", "2"))  # Spoken
-METADATA_PROFILE_ID = int(os.getenv("METADATA_PROFILE_ID", "1"))  # Standard
-MONITOR_TYPE = os.getenv("MONITOR_TYPE", "specificBook")  # or "all"
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "9876"))
+QUALITY_PROFILE_ID = _env_int("QUALITY_PROFILE_ID", 2)
+METADATA_PROFILE_ID = _env_int("METADATA_PROFILE_ID", 1)
+MONITOR_TYPE = os.getenv("MONITOR_TYPE", "specificBook")
+WEBHOOK_PORT = _env_int("WEBHOOK_PORT", 9876)
 WEBHOOK_ENABLED = os.getenv("WEBHOOK_ENABLED", "true").lower() == "true"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 SEARCH_ON_ADD = os.getenv("SEARCH_ON_ADD", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 STATE_FILE = os.getenv("STATE_FILE", "/data/synced_books.json")
+BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0")
+MAX_WEBHOOK_BODY = 1024 * 1024  # 1 MB
 
 HARDCOVER_API = "https://api.hardcover.app/v1/graphql"
 
@@ -50,7 +65,9 @@ def load_state():
 
 
 def save_state(state):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    dirname = os.path.dirname(STATE_FILE)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -72,8 +89,8 @@ def hardcover_query(query, variables=None):
             log.error("Hardcover GraphQL error: %s", data["errors"])
             return None
         return data.get("data")
-    except (HTTPError, URLError) as e:
-        log.error("Hardcover API error: %s", e)
+    except (HTTPError, URLError):
+        log.exception("Hardcover API error")
         return None
 
 
@@ -91,14 +108,14 @@ def readarr_api(path, method="GET", data=None):
     )
     try:
         resp = urlopen(req, timeout=30)
-        body = resp.read()
-        return json.loads(body) if body else None
+        resp_body = resp.read()
+        return json.loads(resp_body) if resp_body else None
     except HTTPError as e:
         error_body = e.read().decode() if e.fp else ""
         log.error("Readarr API error %s %s: %s %s", method, path, e.code, error_body[:200])
         return None
-    except URLError as e:
-        log.error("Readarr connection error: %s", e)
+    except URLError:
+        log.exception("Readarr connection error for %s", path)
         return None
 
 
@@ -107,10 +124,10 @@ def readarr_get(path):
     req = Request(url, headers={"X-Api-Key": READARR_API_KEY})
     try:
         resp = urlopen(req, timeout=30)
-        body = resp.read()
-        return json.loads(body) if body else None
-    except (HTTPError, URLError) as e:
-        log.error("Readarr GET error %s: %s", path, e)
+        resp_body = resp.read()
+        return json.loads(resp_body) if resp_body else None
+    except (HTTPError, URLError):
+        log.exception("Readarr GET error %s", path)
         return None
 
 
@@ -157,7 +174,6 @@ def search_readarr(title, author=None):
     results = readarr_get(f"/search?term={quote(term)}")
     if not results:
         return None
-    # Find best match
     for r in results:
         r_title = r.get("title", "").lower()
         if title.lower() in r_title or r_title in title.lower():
@@ -185,12 +201,10 @@ def add_book_to_readarr(hardcover_book, existing_authors, existing_books):
     authors = book.get("contributions", [])
     author_name = authors[0]["author"]["name"] if authors else "Unknown"
 
-    # Check if already in Readarr by title
     if title.lower() in existing_books:
         log.debug("Already in Readarr: %s", title)
         return True
 
-    # Search Readarr's metadata database
     search_result = search_readarr(title, author_name)
     if not search_result:
         log.warning("Not found in Readarr search: %s by %s", title, author_name)
@@ -203,7 +217,6 @@ def add_book_to_readarr(hardcover_book, existing_authors, existing_books):
         log.info("[DRY RUN] Would add: %s by %s", title, author_name)
         return True
 
-    # Add author (which adds their books) if not already in Readarr
     foreign_author_id = author_data.get("foreignAuthorId")
     if not foreign_author_id:
         log.warning("No foreignAuthorId for %s", author_name)
@@ -242,6 +255,8 @@ def sync():
         return
     try:
         _sync_inner()
+    except Exception:
+        log.exception("Sync failed")
     finally:
         _sync_lock.release()
 
@@ -252,13 +267,17 @@ def _sync_inner():
         return
 
     state = load_state()
-    shelf_ids = [int(s.strip()) for s in SHELF_IDS.split(",")]
+
+    try:
+        shelf_ids = [int(s.strip()) for s in SHELF_IDS.split(",") if s.strip()]
+    except ValueError:
+        log.error("Invalid SHELF_IDS: %r", SHELF_IDS)
+        return
 
     log.info("Syncing Hardcover shelves %s to Readarr", shelf_ids)
     books = get_hardcover_books(shelf_ids)
     log.info("Total books from Hardcover: %d", len(books))
 
-    # Cache Readarr state once instead of per-book
     existing_authors = get_existing_authors()
     existing_books = get_existing_books()
     log.info("Readarr has %d authors, %d books", len(existing_authors), len(existing_books))
@@ -285,11 +304,19 @@ def _sync_inner():
         else:
             failed += 1
 
-        # Rate limit Readarr API calls
         time.sleep(3)
 
     save_state(state)
     log.info("Sync complete: added=%d skipped=%d failed=%d", added, skipped, failed)
+
+
+def _verify_webhook_signature(body, signature):
+    if not WEBHOOK_SECRET:
+        return True
+    if not signature:
+        return False
+    expected = hmac.new(WEBHOOK_SECRET.encode(), body, "sha256").hexdigest()
+    return hmac.compare_digest(expected, signature)
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -300,13 +327,25 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > MAX_WEBHOOK_BODY:
+            log.warning("Webhook body too large: %d bytes", content_length)
+            self.send_response(413)
+            self.end_headers()
+            return
+
         body = self.rfile.read(content_length)
+
+        signature = self.headers.get("X-Hardcover-Signature", "")
+        if not _verify_webhook_signature(body, signature):
+            log.warning("Webhook signature verification failed")
+            self.send_response(403)
+            self.end_headers()
+            return
 
         try:
             payload = json.loads(body)
             log.info("Webhook received: %s", json.dumps(payload)[:200])
 
-            # Hardcover webhook payload
             event = payload.get("event", "")
             if event in ("book.status_changed", "book.added", "user_book.created"):
                 log.info("Triggering sync from webhook event: %s", event)
@@ -316,8 +355,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "ok"}).encode())
-        except Exception as e:
-            log.error("Webhook error: %s", e)
+        except json.JSONDecodeError:
+            log.warning("Webhook received invalid JSON")
+            self.send_response(400)
+            self.end_headers()
+        except Exception:
+            log.exception("Webhook handler error")
             self.send_response(500)
             self.end_headers()
 
@@ -353,8 +396,8 @@ def polling_loop():
     while True:
         try:
             sync()
-        except Exception as e:
-            log.error("Sync error: %s", e)
+        except Exception:
+            log.exception("Polling sync error")
         log.info("Next sync in %d seconds", POLL_INTERVAL)
         time.sleep(POLL_INTERVAL)
 
@@ -365,26 +408,24 @@ def main():
     log.info("  Shelves: %s", SHELF_IDS)
     log.info("  Poll interval: %ds", POLL_INTERVAL)
     log.info("  Webhook: %s (port %d)", WEBHOOK_ENABLED, WEBHOOK_PORT)
+    log.info("  Webhook auth: %s", "enabled" if WEBHOOK_SECRET else "disabled")
     log.info("  Dry run: %s", DRY_RUN)
 
     if not HARDCOVER_TOKEN:
         log.error("HARDCOVER_TOKEN is required. Get it from https://hardcover.app/account/api")
-        return
+        sys.exit(1)
     if not READARR_API_KEY:
         log.error("READARR_API_KEY is required")
-        return
+        sys.exit(1)
 
-    # Run initial sync
     sync()
 
-    # Start polling thread
     poll_thread = Thread(target=polling_loop, daemon=True)
     poll_thread.start()
 
-    # Start webhook server
     if WEBHOOK_ENABLED:
-        server = HTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
-        log.info("Webhook server listening on port %d", WEBHOOK_PORT)
+        server = HTTPServer((BIND_ADDRESS, WEBHOOK_PORT), WebhookHandler)
+        log.info("Webhook server listening on %s:%d", BIND_ADDRESS, WEBHOOK_PORT)
         log.info("  POST /webhook  - Hardcover webhook endpoint")
         log.info("  GET  /health   - Health check")
         log.info("  GET  /sync     - Trigger manual sync")

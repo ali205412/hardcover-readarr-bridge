@@ -382,8 +382,33 @@ def hardcover_search_book(title, author=None, isbn=None, asin=None):
                     log.debug("Matched by ASIN: %s -> %s", asin, book.get("title"))
                     return book
 
-    # No ISBN/ASIN match - skip to avoid wrong matches
-    log.debug("No ISBN/ASIN match for: %s", title)
+    # 3. Fallback: title + author via editions (requires both to prevent mismatches)
+    if title and author:
+        search_title = title.split(":")[0].strip() if ":" in title else title
+        query = """
+        query ByTitleAuthor($title: String!) {
+            editions(where: {title: {_eq: $title}}, limit: 10) {
+                title
+                book { id title slug contributions { author { name } } }
+            }
+        }
+        """
+        for t in ([search_title, title] if search_title != title else [title]):
+            data = hardcover_query(query, {"title": t})
+            if data:
+                author_lower = author.lower()
+                for ed in data.get("editions", []):
+                    book = ed.get("book", {})
+                    if not book.get("id"):
+                        continue
+                    # Verify author matches
+                    book_authors = [c.get("author", {}).get("name", "").lower()
+                                    for c in book.get("contributions", [])]
+                    if any(author_lower in a or a in author_lower for a in book_authors):
+                        log.debug("Matched by title+author: %s by %s", t, author)
+                        return {"id": book["id"], "title": book["title"], "slug": book.get("slug")}
+
+    log.debug("No match for: %s by %s", title, author)
     return None
 
 

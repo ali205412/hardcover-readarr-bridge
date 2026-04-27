@@ -367,24 +367,8 @@ def hardcover_search_book(title, author=None, isbn=None, asin=None):
                     log.debug("Matched by ASIN: %s -> %s", asin, book.get("title"))
                     return book
 
-    # 3. Fall back to title search via editions
-    search_title = title.split(":")[0].strip() if ":" in title else title
-    query = """
-    query ByTitle($title: String!) {
-        editions(where: {title: {_eq: $title}}, limit: 5) {
-            title
-            book { id title slug }
-        }
-    }
-    """
-    for t in [search_title, title] if search_title != title else [title]:
-        data = hardcover_query(query, {"title": t})
-        if data:
-            for ed in data.get("editions", []):
-                book = ed.get("book", {})
-                if book.get("id"):
-                    return book
-
+    # No ISBN/ASIN match - skip to avoid wrong matches
+    log.debug("No ISBN/ASIN match for: %s", title)
     return None
 
 

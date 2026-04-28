@@ -414,14 +414,14 @@ def hardcover_search_book(title, author=None, isbn=None, asin=None):
             )
             if title_match and author_match and doc.get("id"):
                 log.debug("Matched by search: %s by %s -> id=%s", title, author, doc["id"])
-                return {"id": doc["id"], "title": doc.get("title", ""), "slug": doc.get("slug", "")}
+                return {"id": int(doc["id"]), "title": doc.get("title", ""), "slug": doc.get("slug", "")}
         # If no exact match but first result has matching author, use it
         if hits and author_lower:
             doc = hits[0].get("document", {})
             doc_authors = [a.lower() for a in doc.get("author_names", [])]
             if any(author_lower in a or a in author_lower for a in doc_authors) and doc.get("id"):
                 log.debug("Matched by search (author): %s -> id=%s", title, doc["id"])
-                return {"id": doc["id"], "title": doc.get("title", ""), "slug": doc.get("slug", "")}
+                return {"id": int(doc["id"]), "title": doc.get("title", ""), "slug": doc.get("slug", "")}
 
     log.debug("No match for: %s by %s", title, author)
     return None
@@ -446,15 +446,14 @@ def hardcover_set_book_status(book_id, status_id, progress=None):
         user_book_id = user_book.get("id")
 
         if user_book_id:
-            # No existing read, create one with progress
             pct = round(progress * 100)
-            insert_read = """
-            mutation InsertRead($userBookId: Int!, $read: UserBookReadInput!) {
-                insert_user_book_read(user_book_id: $userBookId, user_book_read: $read) { id }
+            update_mut = """
+            mutation UpdateProgress($id: Int!, $object: UpdateUserBookInput!) {
+                update_user_book(id: $id, object: $object) { id }
             }
             """
-            hardcover_query(insert_read, {"userBookId": user_book_id, "read": {"progress": pct}})
-            log.debug("Created read with progress %d%% for user_book %d", pct, user_book_id)
+            hardcover_query(update_mut, {"id": user_book_id, "object": {"progress": pct}})
+            log.debug("Set progress %d%% on user_book %d", pct, user_book_id)
 
     return result
 

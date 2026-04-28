@@ -382,31 +382,46 @@ def hardcover_search_book(title, author=None, isbn=None, asin=None):
                     log.debug("Matched by ASIN: %s -> %s", asin, book.get("title"))
                     return book
 
-    # 3. Fallback: title + author via editions (requires both to prevent mismatches)
-    if title and author:
-        search_title = title.split(":")[0].strip() if ":" in title else title
-        query = """
-        query ByTitleAuthor($title: String!) {
-            editions(where: {title: {_eq: $title}}, limit: 10) {
-                title
-                book { id title slug contributions { author { name } } }
-            }
+    # 3. Fallback: Typesense full-text search with title + author
+    search_term = f"{title} {author}" if author else title
+    query = """
+    query SearchBook($q: String!) {
+        search(query: $q, query_type: "Book", per_page: 5) {
+            results
         }
-        """
-        for t in ([search_title, title] if search_title != title else [title]):
-            data = hardcover_query(query, {"title": t})
-            if data:
-                author_lower = author.lower()
-                for ed in data.get("editions", []):
-                    book = ed.get("book", {})
-                    if not book.get("id"):
-                        continue
-                    # Verify author matches
-                    book_authors = [c.get("author", {}).get("name", "").lower()
-                                    for c in book.get("contributions", [])]
-                    if any(author_lower in a or a in author_lower for a in book_authors):
-                        log.debug("Matched by title+author: %s by %s", t, author)
-                        return {"id": book["id"], "title": book["title"], "slug": book.get("slug")}
+    }
+    """
+    data = hardcover_query(query, {"q": search_term})
+    if data and data.get("search"):
+        results = data["search"].get("results", {})
+        if isinstance(results, str):
+            try:
+                results = json.loads(results)
+            except json.JSONDecodeError:
+                results = {}
+        hits = results.get("hits", [])
+        title_lower = title.lower()
+        author_lower = (author or "").lower()
+        for hit in hits:
+            doc = hit.get("document", {})
+            doc_title = doc.get("title", "").lower()
+            doc_authors = [a.lower() for a in doc.get("author_names", [])]
+            # Verify title similarity
+            title_match = title_lower in doc_title or doc_title in title_lower
+            # Verify author if provided
+            author_match = not author or any(
+                author_lower in a or a in author_lower for a in doc_authors
+            )
+            if title_match and author_match and doc.get("id"):
+                log.debug("Matched by search: %s by %s -> id=%s", title, author, doc["id"])
+                return {"id": doc["id"], "title": doc.get("title", ""), "slug": doc.get("slug", "")}
+        # If no exact match but first result has matching author, use it
+        if hits and author_lower:
+            doc = hits[0].get("document", {})
+            doc_authors = [a.lower() for a in doc.get("author_names", [])]
+            if any(author_lower in a or a in author_lower for a in doc_authors) and doc.get("id"):
+                log.debug("Matched by search (author): %s -> id=%s", title, doc["id"])
+                return {"id": doc["id"], "title": doc.get("title", ""), "slug": doc.get("slug", "")}
 
     log.debug("No match for: %s by %s", title, author)
     return None

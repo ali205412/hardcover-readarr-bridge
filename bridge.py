@@ -428,7 +428,6 @@ def hardcover_search_book(title, author=None, isbn=None, asin=None):
 
 
 def hardcover_set_book_status(book_id, status_id, progress=None):
-    # 1. Set book status (adds to shelf)
     mutation = """
     mutation SetStatus($bookId: Int!, $statusId: Int!) {
         insert_user_book(object: {book_id: $bookId, status_id: $statusId}) {
@@ -436,26 +435,7 @@ def hardcover_set_book_status(book_id, status_id, progress=None):
         }
     }
     """
-    result = hardcover_query(mutation, {"bookId": book_id, "statusId": status_id})
-    if not result:
-        return None
-
-    # 2. Update progress if provided and book is in-progress
-    if progress is not None and 0 < progress < 1.0:
-        user_book = result.get("insert_user_book", {})
-        user_book_id = user_book.get("id")
-
-        if user_book_id:
-            pct = round(progress * 100)
-            update_mut = """
-            mutation UpdateProgress($id: Int!, $object: UpdateUserBookInput!) {
-                update_user_book(id: $id, object: $object) { id }
-            }
-            """
-            hardcover_query(update_mut, {"id": user_book_id, "object": {"progress": pct}})
-            log.debug("Set progress %d%% on user_book %d", pct, user_book_id)
-
-    return result
+    return hardcover_query(mutation, {"bookId": book_id, "statusId": status_id})
 
 
 def sync_abs_to_hardcover():
